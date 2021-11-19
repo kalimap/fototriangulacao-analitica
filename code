@@ -1,0 +1,314 @@
+clc
+clear
+
+%% *****************************
+%  TRANSFORMAÇÃO DE REFERENCIAIS
+%  *****************************
+
+%Abrir arquivos de coordenadas observadas no Qgis dos Pontos (Apoio e Check) no ref colunaxlinha
+pts1=dlmread('Coordenadas Medidas');
+%%Mudar o sentido das linhas para valores positivos 
+%No Qgis a origem do ref é no canto esquerdo superior mas Y cresce para cima
+pts1(:,2)=-pts1(:,2);
+
+%Tamanho do pixel em mm
+px=4.6*10^(-3);
+%Distância Focal em mm
+c=50;
+
+%Transformação de coordenadas Ref CxL para Ref em mm (Centro da Imagem)
+%Dimensões da foto em número total de pixels de linhas (nl) e de colunas (nc) em pixels
+nl=8708;
+nc=11608;
+pts2(:,1)=px*(pts1(:,1)-((nc-1)/2));
+pts2(:,2)=-px*(pts1(:,2)-((nl-1)/2));
+%Rotação em de 90° (para a esquerda) para coincidir o eixo X com a linha de vôo
+%Substituindo sen e cos de 90°, resta x=y; y=-x
+pts3(:,1)=pts2(:,2);
+pts3(:,2)=-pts2(:,1);
+
+%Tranformação de coordenadas Ref em mm para Ref fotogramétrico com distorção
+x0pp=-0.223;
+y0pp=0.051;
+%Subtrair coordenadas do PP
+pts4(:,1)=pts3(:,1)-x0pp;
+pts4(:,2)=pts3(:,2)-y0pp;
+
+%Tranformação de Ref fotogramétrico com para sem distorção radial simétrica
+%Raio dos pontos
+rpts=sqrt((pts4(:,1)).^2+(pts4(:,2)).^2);
+%Coeficientes da distorção radial simétrica
+k1=-1.5604645*10^(-5);
+k2=4.0643961*10^(-9);
+
+%Ref fotogramétrico sem distorção radial simétrica
+pts5(:,1)=pts3(:,1)-(k1*rpts.^2+k2*rpts.^4).*pts4(:,1);
+pts5(:,2)=pts3(:,2)-(k1*rpts.^2+k2*rpts.^4).*pts4(:,2);
+
+%% **************************
+%  AJUSTAMENTO COM INJUNÇÕES
+%  **************************
+%POEs Aproximados
+%Altura de voo
+b=sqrt((-21.0620-9.4318)^2+(2.6372+6.3135)^2);
+B=sqrt((1097.753-1016.218)^2+(1392.469-1035.007)^2);
+H=B*c/b;
+%Kappa
+azf=atan((2.6372+6.3135)/(21.0620+9.4318));
+azg=atan((1097.753-1016.218)/(1392.469-1035.007));
+kappa=(azf-azg);
+
+%MATRIZ X0 (Valores dos parâmetros aproximados para primeira iteração)
+xap=dlmread('Parâmetros Aproximados');
+
+%MATRIZ Xobs (Coordenadas observadas do ponto no ref geodésico)
+xobs=dlmread('Coordenadas geodésicas dos pontos.txt');
+
+%MATRIZ P
+p=eye(56)*(1/((0.5*px)^2));
+%Matriz Pc
+pc=zeros(42,42);
+%i se refere aos parâmetros XYZ dos 4 primeiros pontos (pontos de controle)
+for i=13:24
+    pc(i,i)=1/((0.1)^2);
+end
+
+%Rotações em omega, phi e kapa
+syms om ph ka
+rom=[1 0 0; 0 cos(om) sin(om); 0 -sin(om) cos(om)];
+rph=[cos(ph) 0 -sin(ph); 0 1 0; sin(ph) 0 cos(ph)];
+rka=[cos(ka) sin(ka) 0; -sin(ka) cos(ka) 0; 0 0 1];
+%Matriz M de Rotação primária em om, secund em phi e terc em kapa
+m=rka*rph*rom;
+
+%Equações de colinearidade
+syms x0 y0 z0 x y z
+eqx=-c*((m(1,1)*(x-x0)+m(1,2)*(y-y0)+m(1,3)*(z-z0))/(m(3,1)*(x-x0)+m(3,2)*(y-y0)+m(3,3)*(z-z0)));
+eqy=-c*((m(2,1)*(x-x0)+m(2,2)*(y-y0)+m(2,3)*(z-z0))/(m(3,1)*(x-x0)+m(3,2)*(y-y0)+m(3,3)*(z-z0)));
+%Derivadas em relação aos parâmetros
+dom=[diff(eqx,om) diff(eqy,om)];
+dph=[diff(eqx,ph) diff(eqy,ph)];
+dka=[diff(eqx,ka) diff(eqy,ka)];
+dx0=[diff(eqx,x0) diff(eqy,x0)];
+dy0=[diff(eqx,y0) diff(eqy,y0)];
+dz0=[diff(eqx,z0) diff(eqy,z0)];
+dx=[diff(eqx,x) diff(eqy,x)];
+dy=[diff(eqx,y) diff(eqy,y)];
+dz=[diff(eqx,z) diff(eqy,z)];
+
+%MATRIZ Lb (São as coordenadas medidas que foram transformadas)
+%A função "rem" retorna o resto da divisão i/2, nesse caso os ímpares os valores X e pares de Y
+%O loop armaneza em lb as observações no qgis, que foram transformadas no referencial fotogramétrico sem distorção, em uma única coluna
+%lp se refere à qual linha da matriz pts4 será coletada
+lb=zeros(56,1);
+for i=1:56
+    
+    %Valores de x
+    if rem(i,2)==1
+        lp=(i+1)/2;
+        lb(i,1)=pts5(lp,1);
+    end
+    
+    %Valores de y
+    if rem(i,2)==0
+        lp=i/2;
+        lb(i,1)=pts5(lp,2);
+    end
+    
+end
+
+%Loop de iterações
+
+%DEFINIR ITERAÇÕES
+%Número de iterações iniciais
+    it=0;
+    fim=true;
+%Loop do ajustamento repetir iterções ou até X <= tolerância
+while fim==true
+    
+%Matriz A
+%j se refere à qual coluna da matriz xap será coletada, ou seja, o X de qual ponto de controle
+%começando do elemento 13 porque os 12 primeiros são POEs
+a=zeros(56,54);
+for i=1:28
+    
+    %Equações de x
+    if rem (i,2)==1
+        j=((i+1)/2)*3+10;
+        
+        %Foto 355
+        a(i,1)=subs(dom(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,2)=subs(dph(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,3)=subs(dka(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,4)=subs(dx0(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,5)=subs(dy0(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,6)=subs(dz0(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,j)=subs(dx(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,j+1)=subs(dy(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,j+2)=subs(dz(1),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        
+        %Foto 356
+        a(i+28,7)=subs(dom(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,8)=subs(dph(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,9)=subs(dka(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,10)=subs(dx0(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,11)=subs(dy0(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,12)=subs(dz0(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,j)=subs(dx(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,j+1)=subs(dy(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,j+2)=subs(dz(1),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+   
+    end
+    
+    %Equações de y
+    if rem(i,2)==0
+        j=(i/2)*3+10;
+        
+        %Foto 355
+        a(i,1)=subs(dom(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,2)=subs(dph(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,3)=subs(dka(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,4)=subs(dx0(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,5)=subs(dy0(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,6)=subs(dz0(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,j)=subs(dx(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,j+1)=subs(dy(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        a(i,j+2)=subs(dz(2),[om ph ka x0 y0 z0 x y z],[xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        
+        %Foto 356
+        a(i+28,7)=subs(dom(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,8)=subs(dph(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,9)=subs(dka(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,10)=subs(dx0(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,11)=subs(dy0(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,12)=subs(dz0(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,j)=subs(dx(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,j+1)=subs(dy(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+        a(i+28,j+2)=subs(dz(2),[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+    
+    end
+        
+end
+
+%Matriz L (L0-Lb)
+%L0
+l0=zeros(56,1);
+for i=1:28
+    
+    %Equações de x
+    if rem(i,2)==1
+        j=((i+1)/2)*3+10;
+        %Foto 355
+        l0(i,1)=subs(eqx,[om ph ka x0 y0 z0 x y z], [xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        %Foto 356
+        l0(i+28,1)=subs(eqx,[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+    end
+    
+    %Equações de y
+    if rem(i,2)==0
+        j=(i/2)*3+10;
+        %Foto 355
+        l0(i,1)=subs(eqy,[om ph ka x0 y0 z0 x y z], [xap(1) xap(2) xap(3) xap(4) xap(5) xap(6) xap(j) xap(j+1) xap(j+2)]);
+        %Foto 356
+        l0(i+28,1)=subs(eqy,[om ph ka x0 y0 z0 x y z],[xap(7) xap(8) xap(9) xap(10) xap(11) xap(12) xap(j) xap(j+1) xap(j+2)]);
+    end
+    
+end
+%L
+l=l0-lb;
+
+%Matriz (N+Nc)
+%N
+n=(a'*p*a);
+%Nc
+nc=zeros(54,54);
+%i se refere aos parâmetros XYZ dos 4 primeiros pontos (pontos de controle)
+%Nc é apenas os pesos dos pontos de controle (1/variância)
+for i=13:24
+    nc(i,i)=1/((0.1)^2);
+end
+%N+Nc
+nnc=n+nc;
+
+%Matriz (U+Uc)
+%U
+u=a'*p*l;
+%Uc
+uc=zeros(54,1);
+for i=1:4
+    j=10+i*3;
+    uc(j,1)=(xap(j)-xobs(i,1))*(1/((0.1)^2));
+    uc(j+1,1)=(xap(j+1)-xobs(i,2))*(1/((0.1)^2));
+    uc(j+2,1)=(xap(j+2)-xobs(i,3))*(1/((0.1)^2));
+end
+%U+Uc
+uuc=u+uc;
+
+%Matriz X
+xc=-inv(nnc)*uuc;
+xa=xap+xc;
+xap=xa;
+
+%Resultados
+%Matriz V dos Resíduos
+v=a*xc+l;
+%Matriz Wl (Matriz Erro das injuções)
+wl=zeros(42,1);
+for i=1:4
+    j=10+i*3;
+    j2=((i-1)*3)+1;
+    wl(j2,1)=xap(j)-xobs(i,1);
+    wl(j2+1,1)=xap(j+1)-xobs(i,2);
+    wl(j2+2,1)=xap(j+2)-xobs(i,3);
+end
+
+%Verificação de Valores e Fim do Loop
+it=it+1
+fim=((max(abs(xc))>10^-6)&&(it<8));
+
+end
+
+%Variância à posteriori
+%Grau de liberdade (n de equações + n de equações de injuções - n de parametros/incógnitas)
+gl=size(lb,1)+4*3-size(xap,1);
+varp=(v'*p*v+wl'*pc*wl)/gl;
+
+%Matriz Variância Covariância (MVC) dos parâmetros
+mvc=varp*inv(nnc);
+%Desvio padrão dos POEs
+dp=sqrt(diag(mvc(1:12,1:12)));
+
+%% ANÁLISE ESTATÍSTICA
+%Precisão (Pontos de Apoio - 4 primeiros)
+pr=zeros(4,3);
+for i=1:4
+    j=10+i*3;
+    pr(i,1)=xa(j)-xobs(i,1);
+    pr(i,2)=xa(j+1)-xobs(i,2);
+    pr(i,3)=xa(j+2)-xobs(i,3);
+end
+%Media/Desvio padrao
+prmd(1,:)=mean(pr);
+prmd(2,:)=std(pr);
+
+%Acurácia (Pontos de Check - Pontos 5 à 14)
+ac=zeros(10,3);
+for i=5:14
+    j=10+i*3;
+    ac(i-4,1)=xa(j)-xobs(i,1);
+    ac(i-4,2)=xa(j+1)-xobs(i,2);
+    ac(i-4,3)=xa(j+2)-xobs(i,3);
+end
+%Media/Desvio padrao
+acmd(1,1:3)=mean(ac);
+acmd(2,1:3)=std(ac);
+
+%Teste do qui-quadrado
+qui=(varp/1)*gl;
+
+%%Calculo parâmetro aproximado: kappa
+
+%Azimute Geodésico da linha de voo (P89 para P07)
+azlv=atan((1249.151-1090.617)/(993.153-1012.825))+pi();
+kapa=pi()/2-azlv;
+
